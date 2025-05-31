@@ -29,4 +29,4 @@
 
 ### 给我买杯西瓜啵啵
 
-![coffee](./Co2Fe/coffee.png)
+<img src="./Co2Fe/coffee.png" alt="coffee" width="200">
