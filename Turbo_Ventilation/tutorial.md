@@ -17,19 +17,18 @@
 
 ### 🛒 建议购买成品
 
-* 18650*3 12V锂电池（2800mAh）
-  
-  <img title="" src="./images/battery.png" alt="battery" style="zoom:25%;">
+* 18650*3 12V锂电池（2800mAh）  
+  <img src="./images/battery.png" alt="battery" width="200"/>
 
 * 7-24V 涵道风扇（带电调和转速控制器，电路板部分为出风口）
 
-* <img src="./images/motor_link.png" title="" alt="motor2" style="zoom:25%;">
+* <img src="./images/motor_link.png" alt="motor2" width="200"/>
 
-* <img src="./images/motor.png" title="" alt="motor" style="zoom:25%;">
+* <img src="./images/motor.png" alt="motor" width="200"/>
 
 * 内径12mm，外径16mm橡胶管、内径17mm，外径22mm橡胶管（可选）
 
-* <img src="./images/pipe.png" title="" alt="pipe" style="zoom:25%;">
+* <img src="./images/pipe.png" alt="pipe" width="200"/>
 
 ### 🧵 其他工具
 
@@ -44,7 +43,7 @@
 🛠️ 安装步骤
 --------
 
-<img title="" src="./images/final.png" alt="final" style="zoom:25%;">
+<img src="./images/final.png" alt="final" width="200"/>
 
 ### 1. 打印所有模型文件
 
