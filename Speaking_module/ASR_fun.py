@@ -1,189 +1,173 @@
-import speech_recognition as sr
-from funasr import AutoModel
-import client
-import firefly_rewriter
+import argparse
+import os
+import sys
+import logging
 import time
 import numpy as np
-from modelscope.pipelines import pipeline
-from modelscope.utils.constant import Tasks
-import os
-import logging
-import tempfile
+import speech_recognition as sr
 
-# 配置日志
+# 日志配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 检查是否支持MLX
-try:
-    import mlx.core as mx
-    DEVICE = "mlx"
-    logger.info("Apple Silicon GPU (MLX) 支持已启用")
-except ImportError:
-    DEVICE = "cpu"
-    logger.warning("未找到MLX支持，将使用CPU")
-
-# 1. 加载FunASR模型
-print("正在加载FunASR模型...")
-funasr_model = AutoModel(
-    model="paraformer-zh",
-    model_revision="v2.0.4",
-    vad_model="fsmn-vad",
-    vad_revision="v2.0.4",
-    punc_model="ct-punc-c",
-    punc_revision="v2.0.4",
-    device=DEVICE  # 使用MLX或CPU
-)
-print("模型加载完成。")
-
-# 2. 加载说话人识别模型
-print("正在加载说话人识别模型...")
-try:
-    sv_pipeline = pipeline(
-        task='speaker-verification',
-        model='iic/speech_campplus_sv_zh-cn_16k-common',
-        model_revision='v1.0.0',
-        device="gpu"  # 使用MLX或CPU
-    )
-    print("说话人识别模型加载完成。")
-    
-    # 3. 注册目标说话人
-    enroll_audio_dir = "./speaker_audio"
-    enroll_audio_paths = []
-    threshold = 0.5
-    
-    if os.path.exists(enroll_audio_dir) and os.path.isdir(enroll_audio_dir):
-        enroll_audio_paths = [os.path.join(enroll_audio_dir, f) for f in os.listdir(enroll_audio_dir) 
-                              if f.endswith(('.wav', '.mp3', '.flac'))]
-        
-        if enroll_audio_paths:
-            logger.info(f"找到 {len(enroll_audio_paths)} 个注册音频文件")
+# 设备检测与选择
+def detect_device(prefer_cuda=False, prefer_mlx=False):
+    if prefer_mlx:
+        try:
+            import mlx.core as mx
+            logger.info("Apple Silicon GPU (MLX) 支持已启用")
+            return "mlx"
+        except ImportError:
+            logger.warning("未检测到MLX，将尝试CUDA/CPU")
+    if prefer_cuda:
+        import torch
+        if torch.cuda.is_available():
+            logger.info("CUDA可用，使用GPU")
+            return "cuda"
         else:
-            logger.warning("注册音频目录为空")
+            logger.warning("CUDA不可用，使用CPU")
+    logger.info("使用CPU")
+    return "cpu"
+
+# CLI参数
+def parse_args():
+    parser = argparse.ArgumentParser(description="多平台语音识别+TTS+LLM角色扮演 Demo")
+    parser.add_argument("--enable-llm", action="store_true", help="启用LLM润色输出")
+    parser.add_argument("--tts-url", type=str, default="http://127.0.0.1:9880/", help="TTS服务地址")
+    parser.add_argument("--llm-url", type=str, default="http://127.0.0.1:1234/v1", help="LLM服务地址")
+    parser.add_argument("--llm-key", type=str, default=None, help="LLM API Key")
+    parser.add_argument("--llm-model", type=str, default="lmstudio-community/qwen2.5-3b-gguf/qwen-2.5-3b-instruct-10e-gguf_q8_0.gguf", help="LLM模型名")
+    parser.add_argument("--device", choices=["cpu", "cuda", "mlx"], default="auto", help="推理设备：cpu/cuda/mlx/auto")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    # 设备选择
+    if args.device == "auto":
+        DEVICE = detect_device(prefer_cuda=True, prefer_mlx=True)
     else:
-        logger.warning(f"未找到注册音频目录: {enroll_audio_dir}")
-except Exception as e:
-    logger.error(f"加载说话人识别模型失败: {str(e)}")
-    sv_pipeline = None
-    enroll_audio_paths = []
+        DEVICE = args.device
 
-def recognize_funasr(audio_data):
-    """使用FunASR进行非流式语音识别"""
-    audio_np = np.frombuffer(audio_data.get_raw_data(), dtype=np.int16)
-    audio_np = audio_np.astype(np.float32) / 32768.0
-    
-    # 关键优化：降低批处理大小
-    result = funasr_model.generate(
-        input=[audio_np],
-        batch_size_s=50,  # 优化为短句处理
-        hotword='',
+    # 加载ASR模型
+    from funasr import AutoModel
+    print("正在加载FunASR模型...")
+    funasr_model = AutoModel(
+        model="paraformer-zh",
+        model_revision="v2.0.4",
+        vad_model="fsmn-vad",
+        vad_revision="v2.0.4",
+        punc_model="ct-punc-c",
+        punc_revision="v2.0.4",
+        device=DEVICE
     )
-    
-    if result and isinstance(result, list) and len(result) > 0:
-        return result[0].get("text", "")
-    return ""
+    print("ASR模型加载完成。")
 
-def verify_speaker(audio_data):
-    """验证说话人是否匹配注册的说话人"""
-    if not enroll_audio_paths or not sv_pipeline:
-        return True
-    
-    # 优化：只使用第一个注册音频验证
-    enroll_audio = enroll_audio_paths[0]
-    
+    # 可选加载说话人识别
     try:
-        # 将音频数据转换为numpy数组
+        from modelscope.pipelines import pipeline
+        sv_pipeline = pipeline(
+            task='speaker-verification',
+            model='iic/speech_campplus_sv_zh-cn_16k-common',
+            model_revision='v1.0.0',
+            device=DEVICE if DEVICE != "mlx" else "cpu"  # speaker verification一般无mlx
+        )
+        enroll_audio_dir = "./speaker_audio"
+        enroll_audio_paths = []
+        if os.path.exists(enroll_audio_dir) and os.path.isdir(enroll_audio_dir):
+            enroll_audio_paths = [os.path.join(enroll_audio_dir, f) for f in os.listdir(enroll_audio_dir) 
+                                if f.endswith(('.wav', '.mp3', '.flac'))]
+    except Exception as e:
+        sv_pipeline = None
+        enroll_audio_paths = []
+        logger.warning(f"说话人识别加载失败: {str(e)}")
+
+    def recognize_funasr(audio_data):
         audio_np = np.frombuffer(audio_data.get_raw_data(), dtype=np.int16)
         audio_np = audio_np.astype(np.float32) / 32768.0
-        
-        # 直接使用内存中的音频数据进行验证
-        # 注意：这里假设sv_pipeline可以直接处理numpy数组
-        # 如果模型需要文件路径，则需要修改为内存处理方式
-        result = sv_pipeline([enroll_audio, audio_np],output_emb=True)
-        
-        if result['outputs'] and "text" in result['outputs'] and result['outputs']["text"] == "yes":
-            logger.info(f"说话人验证通过: {os.path.basename(enroll_audio)}")
-            return [True,result['embs']]
-        elif result['outputs']:
-            score = result['outputs'].get("score", 0)
-            logger.info(f"说话人不匹配: {os.path.basename(enroll_audio)}, 得分: {score:.4f}")
-        return [False,result['embs']]
-    except Exception as e:
-        logger.error(f"说话人验证失败: {str(e)}")
-        return [False,result['embs']]
-
-# 2. 初始化麦克风和识别器
-r = sr.Recognizer()
-# 关键优化：VAD参数调整
-r.non_speaking_duration = 0.1   # 降低非说话时间
-r.pause_threshold = 0.4         # 大幅降低停顿阈值（适合短句）
-
-mic = sr.Microphone(sample_rate=16000)
-
-# 初始化TTS客户端
-client = client.TTSStreamingClient(
-        api_url="http://127.0.0.1:9880/",
-        sample_rate=24000,
+        result = funasr_model.generate(
+            input=[audio_np],
+            batch_size_s=50,
+            hotword='',
+        )
+        if result and isinstance(result, list) and len(result) > 0:
+            return result[0].get("text", "")
+        return ""
+    
+    def verify_speaker(audio_data):
+        if not enroll_audio_paths or not sv_pipeline:
+            return [True, None]
+        enroll_audio = enroll_audio_paths[0]
+        try:
+            audio_np = np.frombuffer(audio_data.get_raw_data(), dtype=np.int16)
+            audio_np = audio_np.astype(np.float32) / 32768.0
+            result = sv_pipeline([enroll_audio, audio_np],output_emb=True,thr=0.20)
+            if result['outputs'] and "text" in result['outputs'] and result['outputs']["text"] == "yes":
+                return [True,result['embs']]
+            return [False,result['embs']]
+        except Exception as e:
+            logger.error(f"说话人验证失败: {str(e)}")
+            return [False,None]
+    
+    # 初始化TTS客户端
+    import client
+    tts_client = client.TTSStreamingClient(
+        api_url=args.tts_url,
+        sample_rate=16000,
         channels=1,
-        chunk_size=256
+        chunk_size=128
     )
+    # 初始化LLM
+    if args.enable_llm:
+        import firefly_rewriter
+        llm_rewriter = firefly_rewriter.LiuYingCosplayRewriter(
+            api_key=args.llm_key,
+            model=args.llm_model,
+            base_url=args.llm_url
+        )
+        logger.info("LLM润色已启用")
+    else:
+        llm_rewriter = None
+        logger.info("未启用LLM润色")
 
-client.stream_tts("测试输出", text_language="zh")
-# 初始化LLM
-liuying = firefly_rewriter.LiuYingCosplayRewriter(
-        api_key=None,
-        model="lmstudio-community/qwen2.5-3b-gguf/qwen-2.5-3b-instruct-10e-gguf_q8_0.gguf",
-        base_url="http://127.0.0.1:1234/v1"
-    )
+    # 语音识别流程
+    r = sr.Recognizer()
+    r.non_speaking_duration = 0.1
+    r.pause_threshold = 0.4
+    mic = sr.Microphone(sample_rate=16000)
+    with mic as source:
+        print("采集环境噪声...")
+        r.adjust_for_ambient_noise(source, duration=1.0)
+        print(f"环境噪声阈值: {r.energy_threshold:.2f}")
 
-with mic as source:
-    # 优化：减少噪声采样时间
-    print("正在采集环境噪声...")
-    r.adjust_for_ambient_noise(source, duration=1.0)  # 减少采样时间
-    print(f"环境噪声能量阈值已设置为 {r.energy_threshold:.2f}")
+    print("按 Ctrl+C 退出。参数适用于短句识别")
+    print(f"说话人验证: {'启用' if enroll_audio_paths else '关闭'}，当前设备: {DEVICE}")
 
-print("按 Ctrl+C 停止。优化参数适用于短句识别")
-print(f"说话人验证状态: {'已启用' if enroll_audio_paths else '未启用'}")
-print(f"当前设备: {'Apple Silicon GPU (MLX)' if DEVICE == 'mlx' else 'CPU'}")
+    while True:
+        try:
+            with mic as source:
+                print("\n请说话（短句）...")
+                audio = r.listen(source)
+                print("语音结束，处理中...")
+            # 说话人验证
+            if enroll_audio_paths:
+                is_target_speaker = verify_speaker(audio)
+                if not is_target_speaker[0]:
+                    print("非目标说话人，跳过。")
+                    continue
+            # ASR识别
+            result = recognize_funasr(audio)
+            print("识别文本：", result)
+            # LLM润色（可选）
+            if llm_rewriter:
+                result = llm_rewriter.rewrite(result)
+                print("LLM润色后文本：", result)
+            # TTS合成
+            tts_client.stream_tts(result[:30], text_language="zh")
+        except KeyboardInterrupt:
+            print("\n程序已退出")
+            break
+        except Exception as e:
+            logger.error(f"主循环异常: {str(e)}")
 
-while True:
-    try:
-        with mic as source:
-            print("\n请说短句子(20字左右)...")
-            audio = r.listen(source)
-            speech_end_time = time.time()
-            print("检测到语音结束")
-
-        # 说话人验证（优化为单音频验证）
-        if enroll_audio_paths:
-            print("快速说话人验证中...")
-            is_target_speaker = verify_speaker(audio)
-            if not is_target_speaker[0]:
-                recog_end_time = time.time()
-                print(f"说话人识别处理耗时：{recog_end_time - speech_end_time:.3f}秒")
-                print("非目标说话人，跳过")
-                continue
-        recog_end_time = time.time()
-        print(f"说话人识别处理耗时：{recog_end_time - speech_end_time:.3f}秒")
-        print("识别中...")
-        speech_end_time = time.time()
-        result = recognize_funasr(audio)
-        print("识别结果：", result)
-        
-        recog_end_time = time.time()
-        print(f"ASR处理耗时：{recog_end_time - speech_end_time:.3f}秒")
-
-        # 可选LLM处理
-        # result = liuying.rewrite(result)
-        # print("LLM_output", result)
-
-        tts_start_time = time.time()
-        client.stream_tts(result[:30], text_language="zh")  # 限制输出长度
-        tts_end_time = time.time()
-        print(f"TTS处理耗时：{tts_end_time - tts_start_time:.3f}秒")
-
-    except KeyboardInterrupt:
-        print("\n程序已结束")
-        break
-    except Exception as e:
-        logger.error(f"主循环异常: {str(e)}")
+if __name__ == "__main__":
+    main()
